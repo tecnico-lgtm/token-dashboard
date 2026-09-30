@@ -10,7 +10,7 @@ Inspired by [phuryn/claude-usage](https://github.com/phuryn/claude-usage) but di
 
 ## Status
 
-Working codebase. 68 Python unit tests (`python3 -m unittest discover tests`). Seven UI tabs wired up (Overview, Prompts, Sessions, Projects, Skills, Tips, Settings). Runs on macOS, Windows, and Linux.
+Working codebase. 85 Python unit tests (`python3 -m unittest discover tests`). Seven UI tabs wired up (Overview, Prompts, Sessions, Projects, Skills, Tips, Settings). Runs on macOS, Windows, and Linux.
 
 ## Architecture
 
@@ -28,6 +28,7 @@ Claude Code writes one JSONL file per session to `~/.claude/projects/<project-sl
 - **Stdlib only.** No `pip install`. If a new feature needs a third-party library, argue for it first — we're willing to pay ergonomics cost to keep install friction at zero.
 - **SQLite parameter binding always.** Any f-string in a SQL statement must interpolate only internal, caller-controlled values (column names, placeholder lists). User-reachable values go through `?`.
 - **Small files with clear responsibilities.** If a file grows past ~400 lines or accretes three distinct concerns, split it.
+- **A prompt is `is_prompt = 1`, not `type = 'user'`.** Tool results, `isMeta` injections and command output are also `type='user'` records. Count or group prompts with `is_prompt`; per-prompt costs come from `db.prompt_usage` (every API call until the next prompt).
 - **Streaming-snapshot dedup.** When adding scanner logic that joins the `messages` table, remember `(session_id, message_id)` is the dedup key, not `uuid`. See `scanner._evict_prior_snapshots` and the migration note in `db._migrate_add_message_id`.
 
 ## Customizing
@@ -36,7 +37,7 @@ Env vars: `PORT` (default 8080), `HOST` (default 127.0.0.1), `CLAUDE_PROJECTS_DI
 
 ## Known limitations
 
-See `docs/KNOWN_LIMITATIONS.md`. Current summary: Skills `tokens_per_call` is populated only for skills installed under the three scanned roots (`~/.claude/skills/`, `~/.claude/scheduled-tasks/`, `~/.claude/plugins/`); project-local skills and subagent-dispatched skills show invocation counts but blank token counts.
+See `docs/KNOWN_LIMITATIONS.md`. Current summary: skill sizes and prompt boundaries depend on Claude Code transcript fields (`sourceToolUseID`, `isMeta`); unknown model IDs get current-tier pricing, marked `~`.
 
 ## Verifying changes
 

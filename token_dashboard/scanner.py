@@ -14,18 +14,28 @@ INSERT OR REPLACE INTO messages (
   uuid, parent_uuid, session_id, project_slug, cwd, git_branch, cc_version, entrypoint,
   type, is_sidechain, agent_id, timestamp, model, stop_reason, prompt_id, message_id,
   input_tokens, output_tokens, cache_read_tokens, cache_create_5m_tokens, cache_create_1h_tokens,
-  prompt_text, prompt_chars, tool_calls_json
+  prompt_text, prompt_chars, tool_calls_json, is_prompt, is_meta
 ) VALUES (
   :uuid, :parent_uuid, :session_id, :project_slug, :cwd, :git_branch, :cc_version, :entrypoint,
   :type, :is_sidechain, :agent_id, :timestamp, :model, :stop_reason, :prompt_id, :message_id,
   :input_tokens, :output_tokens, :cache_read_tokens, :cache_create_5m_tokens, :cache_create_1h_tokens,
-  :prompt_text, :prompt_chars, :tool_calls_json
+  :prompt_text, :prompt_chars, :tool_calls_json, :is_prompt, :is_meta
 )
 """
 
+# type='user' records that Claude Code writes itself rather than the human
+# typing them. Older transcripts lack isMeta/origin, so match on content too.
+_SYNTHETIC_PREFIXES = (
+    "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>",
+    "<bash-input>", "<bash-stdout>", "<bash-stderr>",
+    "Caveat: The messages below were generated",
+    "[Request interrupted by user",
+    "[Your previous response had no visible output",
+)
+
 INSERT_TOOL = """
-INSERT INTO tool_calls (message_uuid, session_id, project_slug, tool_name, target, result_tokens, is_error, timestamp)
-VALUES (:message_uuid, :session_id, :project_slug, :tool_name, :target, :result_tokens, :is_error, :timestamp)
+INSERT INTO tool_calls (message_uuid, session_id, project_slug, tool_name, target, result_tokens, is_error, timestamp, tool_use_id)
+VALUES (:message_uuid, :session_id, :project_slug, :tool_name, :target, :result_tokens, :is_error, :timestamp, :tool_use_id)
 """
 
 
@@ -68,6 +78,25 @@ def _prompt_text(rec: dict) -> Tuple[Optional[str], Optional[int]]:
     return None, None
 
 
+def _is_prompt(rec: dict, text: Optional[str]) -> bool:
+    """True when this record is something the human typed into the main chat."""
+    if rec.get("type") != "user" or rec.get("isMeta") or rec.get("isSidechain"):
+        return False
+    if rec.get("isCompactSummary"):
+        return False
+    origin = rec.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+        return False
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, list):
+        kinds = {b.get("type") for b in content if isinstance(b, dict)}
+        if "tool_result" in kinds or not kinds & {"text", "image"}:
+            return False
+    elif not isinstance(content, str):
+        return False
+    return not (text or "").lstrip().startswith(_SYNTHETIC_PREFIXES)
+
+
 def _target(name: str, inp: dict) -> Optional[str]:
     field = _TARGET_FIELDS.get(name)
     if field and isinstance(inp, dict):
@@ -93,6 +122,7 @@ def _extract_tools(rec: dict) -> List[dict]:
             "result_tokens": None,
             "is_error":      0,
             "timestamp":     rec.get("timestamp"),
+            "tool_use_id":   block.get("id"),
         })
     return out
 
@@ -118,8 +148,28 @@ def _extract_results(rec: dict) -> List[dict]:
             "result_tokens": chars // 4,
             "is_error":      1 if block.get("is_error") else 0,
             "timestamp":     rec.get("timestamp"),
+            "tool_use_id":   block.get("tool_use_id"),
         })
     return out
+
+
+def _skill_body(rec: dict, chars: Optional[int]) -> List[dict]:
+    """The SKILL.md text Claude Code injects after a Skill call, as a sized row.
+
+    It arrives as an isMeta user message whose sourceToolUseID names the
+    Skill tool_use, so it can be joined back to the invocation exactly.
+    """
+    source = rec.get("sourceToolUseID")
+    if rec.get("type") != "user" or not rec.get("isMeta") or not source:
+        return []
+    return [{
+        "tool_name":     "_skill_body",
+        "target":        None,
+        "result_tokens": (chars or 0) // 4,
+        "is_error":      0,
+        "timestamp":     rec.get("timestamp"),
+        "tool_use_id":   source,
+    }]
 
 
 def parse_record(rec: dict, project_slug: str) -> Tuple[dict, List[dict]]:
@@ -146,6 +196,8 @@ def parse_record(rec: dict, project_slug: str) -> Tuple[dict, List[dict]]:
         "prompt_text":  text,
         "prompt_chars": chars,
         "tool_calls_json": None,
+        "is_prompt":    1 if _is_prompt(rec, text) else 0,
+        "is_meta":      1 if rec.get("isMeta") else 0,
         **_usage(rec),
     }
     tools = _extract_tools(rec)
@@ -154,6 +206,7 @@ def parse_record(rec: dict, project_slug: str) -> Tuple[dict, List[dict]]:
         msg["tool_calls_json"] = json.dumps(
             [{"name": t["tool_name"], "target": t["target"]} for t in tools if t["tool_name"] != "_tool_result"]
         )
+    tools.extend(_skill_body(rec, chars))
     for t in tools:
         t["message_uuid"] = msg["uuid"]
         t["session_id"]   = msg["session_id"]

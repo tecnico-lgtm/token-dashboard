@@ -7,24 +7,37 @@ export default async function (root) {
 }
 
 async function renderList(root) {
-  const list = await api('/api/sessions?limit=100');
+  const showEmpty = /(?:^|[?&])empty=1/.test(location.hash.split('?')[1] || '');
+  const list = await api('/api/sessions?limit=100' + (showEmpty ? '&empty=1' : ''));
   root.innerHTML = `
     <div class="card">
-      <h2>Sessions</h2>
+      <h2 style="display:flex;align-items:center">
+        <span>Sessions</span>
+        <span class="spacer"></span>
+        <label class="muted" style="font-size:12px;font-weight:normal;cursor:pointer">
+          <input type="checkbox" id="show-empty" ${showEmpty ? 'checked' : ''}> show sessions with no reply
+        </label>
+      </h2>
+      <p class="muted" style="margin:-8px 0 14px">Most recently active first. Tokens are billable (input + output + cache writes); cost includes cache reads.</p>
       <table>
-        <thead><tr><th>started</th><th>project</th><th class="num">turns</th><th class="num">tokens</th><th>session</th></tr></thead>
+        <thead><tr><th>last active</th><th>started</th><th>project</th><th class="num">prompts</th><th class="num">tokens</th><th class="num">cost</th><th>session</th></tr></thead>
         <tbody>
           ${list.map(s => `
             <tr>
-              <td class="mono">${fmt.ts(s.started)}</td>
+              <td class="mono">${fmt.ts(s.ended)}</td>
+              <td class="mono muted">${fmt.ts(s.started)}</td>
               <td title="${fmt.htmlSafe(s.project_slug)}">${fmt.htmlSafe(s.project_name || s.project_slug)}</td>
               <td class="num">${fmt.int(s.turns)}</td>
               <td class="num">${fmt.int(s.tokens)}</td>
+              <td class="num">${s.cost_estimated ? '~' : ''}${fmt.usd(s.cost_usd)}</td>
               <td><a href="#/sessions/${encodeURIComponent(s.session_id)}" class="mono">${fmt.htmlSafe(s.session_id.slice(0,8))}…</a></td>
-            </tr>`).join('')}
+            </tr>`).join('') || '<tr><td colspan="7" class="muted">no sessions yet</td></tr>'}
         </tbody>
       </table>
     </div>`;
+  root.querySelector('#show-empty').addEventListener('change', e => {
+    location.hash = '#/sessions' + (e.target.checked ? '?empty=1' : '');
+  });
 }
 
 async function renderSession(root, id) {

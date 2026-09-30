@@ -68,7 +68,7 @@ export default async function (root) {
 
     <div class="row cols-7">
       ${kpi('Sessions',     fmt.int(totals.sessions),       fmt.int(totals.sessions))}
-      ${kpi('Turns',        fmt.int(totals.turns),          fmt.int(totals.turns))}
+      ${kpi('Prompts',      fmt.int(totals.turns),          fmt.int(totals.turns))}
       ${kpi('Input',        fmt.compact(totals.input_tokens),       fmt.int(totals.input_tokens) + ' tokens')}
       ${kpi('Output',       fmt.compact(totals.output_tokens),      fmt.int(totals.output_tokens) + ' tokens')}
       ${kpi('Cache read',   fmt.compact(totals.cache_read_tokens),  fmt.int(totals.cache_read_tokens) + ' tokens')}
@@ -101,7 +101,7 @@ export default async function (root) {
       </div>
       <div class="card">
         <h3>Daily cache reads</h3>
-        <p class="muted" style="margin:-4px 0 10px;font-size:12px"><b>Cache reads</b> are cheap re-uses of things Claude already saw (like your CLAUDE.md). They cost ~10× less than regular input tokens — high numbers here are a good thing.</p>
+        <p class="muted" style="margin:-4px 0 10px;font-size:12px"><b>Cache reads</b> are cheap re-uses of things Claude already saw (like your CLAUDE.md). They cost 10–40× less than regular input tokens, but long sessions re-read the whole context on every call, so they can still be a big part of the bill (see Projects).</p>
         <div id="ch-daily-cache" style="height:260px"></div>
       </div>
     </div>

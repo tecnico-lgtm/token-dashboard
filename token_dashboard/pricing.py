@@ -2,27 +2,35 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Optional, Union
 
 from .db import connect
 
+DEFAULT_PRICING_PATH = Path(__file__).resolve().parent.parent / "pricing.json"
 
-def load_pricing(path: Union[str, Path]) -> dict:
+_DATE_SUFFIX = re.compile(r"-\d{8}$")
+
+
+def load_pricing(path: Union[str, Path] = DEFAULT_PRICING_PATH) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def _tier_from_name(model: str) -> Optional[str]:
     m = (model or "").lower()
-    for tier in ("opus", "sonnet", "haiku"):
-        if tier in m:
+    for tier, needles in (("fable", ("fable", "mythos")), ("opus", ("opus",)),
+                          ("sonnet", ("sonnet",)), ("haiku", ("haiku",))):
+        if any(n in m for n in needles):
             return tier
     return None
 
 
 def cost_for(model: str, usage: dict, pricing: dict) -> dict:
     """Return {usd, estimated, breakdown}. usd=None when no tier match."""
-    rates = pricing["models"].get(model)
+    models = pricing["models"]
+    # Dated snapshots (claude-haiku-4-5-20251001) bill like their alias.
+    rates = models.get(model) or models.get(_DATE_SUFFIX.sub("", model or ""))
     estimated = False
     if rates is None:
         tier = _tier_from_name(model or "")

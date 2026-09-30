@@ -11,18 +11,18 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from .db import (
-    overview_totals, expensive_prompts, project_summary,
-    tool_token_breakdown, recent_sessions, session_turns,
-    daily_token_breakdown, model_breakdown, skill_breakdown,
+    overview_totals, tool_token_breakdown, session_turns,
+    daily_token_breakdown, model_breakdown, skill_breakdown, skill_body_tokens,
 )
-from .pricing import load_pricing, cost_for, get_plan, set_plan
+from .costs import prompt_costs, project_costs, session_costs
+from .pricing import DEFAULT_PRICING_PATH, load_pricing, cost_for, get_plan, set_plan
 from .tips import all_tips, dismiss_tip
 from .scanner import scan_dir
 from .skills import cached_catalog
 
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
-PRICING_JSON = Path(__file__).resolve().parent.parent / "pricing.json"
+PRICING_JSON = DEFAULT_PRICING_PATH
 
 EVENTS: "queue.Queue[dict]" = queue.Queue()
 
@@ -99,33 +99,34 @@ def build_handler(db_path: str, projects_dir: str):
                 return _send_json(self, totals)
             if path == "/api/prompts":
                 limit = _clamp_limit(qs.get("limit", ["50"])[0], 50)
-                sort = qs.get("sort", ["tokens"])[0]
-                rows = expensive_prompts(db_path, limit=limit, sort=sort)
-                for r in rows:
-                    c = cost_for(r["model"], {
-                        "input_tokens": 0, "output_tokens": 0,
-                        "cache_read_tokens": r["cache_read_tokens"],
-                        "cache_create_5m_tokens": 0, "cache_create_1h_tokens": 0,
-                    }, pricing)
-                    r["estimated_cost_usd"] = c["usd"]
-                return _send_json(self, rows)
+                sort = qs.get("sort", ["cost"])[0]
+                return _send_json(self, prompt_costs(
+                    db_path, pricing, sort=sort, limit=limit, since=since, until=until,
+                ))
             if path == "/api/projects":
-                return _send_json(self, project_summary(db_path, since, until))
+                return _send_json(self, project_costs(db_path, pricing, since, until))
             if path == "/api/tools":
                 return _send_json(self, tool_token_breakdown(db_path, since, until))
             if path == "/api/sessions":
-                return _send_json(self, recent_sessions(
-                    db_path, limit=_clamp_limit(qs.get("limit", ["20"])[0], 20),
+                return _send_json(self, session_costs(
+                    db_path, pricing, limit=_clamp_limit(qs.get("limit", ["20"])[0], 20),
                     since=since, until=until,
+                    include_empty=qs.get("empty", ["0"])[0] == "1",
                 ))
             if path == "/api/daily":
                 return _send_json(self, daily_token_breakdown(db_path, since, until))
             if path == "/api/skills":
                 rows = skill_breakdown(db_path, since, until)
+                measured = skill_body_tokens(db_path, since, until)
                 catalog = cached_catalog()
                 for r in rows:
                     info = catalog.get(r["skill"])
-                    r["tokens_per_call"] = info["tokens"] if info else None
+                    if measured.get(r["skill"]) is not None:
+                        r["tokens_per_call"], r["tokens_source"] = measured[r["skill"]], "transcript"
+                    elif info:
+                        r["tokens_per_call"], r["tokens_source"] = info["tokens"], "SKILL.md"
+                    else:
+                        r["tokens_per_call"], r["tokens_source"] = None, None
                 return _send_json(self, rows)
             if path == "/api/by-model":
                 rows = model_breakdown(db_path, since, until)
@@ -138,7 +139,7 @@ def build_handler(db_path: str, projects_dir: str):
                 sid = path.rsplit("/", 1)[1]
                 return _send_json(self, session_turns(db_path, sid))
             if path == "/api/tips":
-                return _send_json(self, all_tips(db_path))
+                return _send_json(self, all_tips(db_path, pricing=pricing))
             if path == "/api/plan":
                 return _send_json(self, {"plan": get_plan(db_path), "pricing": pricing})
             if path == "/api/scan":

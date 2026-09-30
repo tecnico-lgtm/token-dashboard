@@ -5,7 +5,8 @@ import time
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from .db import connect
+from .db import connect, prompt_usage
+from .pricing import _tier_from_name, cost_for, load_pricing
 
 
 def _iso_days_ago(today_iso: str, n: int) -> str:
@@ -65,25 +66,49 @@ def cache_discipline_tips(db_path, today_iso: Optional[str] = None) -> List[dict
     return out
 
 
+def _redundant_reads(conn, since: str) -> List[dict]:
+    """Per file: Reads that re-fetched content Claude had already seen.
+
+    A Read right after an Edit/Write of the same file is Claude checking its
+    own change, and the first Read in a session is unavoidable — neither is
+    counted. Edits and Writes themselves are never counted as reads.
+    """
+    counts, sessions = {}, {}
+    seen, dirty = set(), set()
+    for row in conn.execute("""
+      SELECT session_id, tool_name, target
+        FROM tool_calls
+       WHERE tool_name IN ('Read','Edit','Write') AND target IS NOT NULL AND timestamp >= ?
+       ORDER BY session_id, timestamp, id
+    """, (since,)):
+        k = (row["session_id"], row["target"])
+        if row["tool_name"] != "Read":
+            dirty.add(k)
+            seen.add(k)
+            continue
+        if k in dirty:
+            dirty.discard(k)
+        elif k in seen:
+            counts[row["target"]] = counts.get(row["target"], 0) + 1
+            sessions.setdefault(row["target"], set()).add(row["session_id"])
+        seen.add(k)
+    return [{"target": t, "n": n, "sessions": len(sessions[t])}
+            for t, n in sorted(counts.items(), key=lambda kv: -kv[1])]
+
+
 def repeated_target_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
     today_iso = today_iso or datetime.utcnow().isoformat()
     since = _iso_days_ago(today_iso, 7)
     out = []
     with connect(db_path) as c:
-        for row in c.execute("""
-          SELECT target, COUNT(*) AS n, COUNT(DISTINCT session_id) AS sessions
-            FROM tool_calls
-           WHERE tool_name IN ('Read','Edit','Write') AND timestamp >= ?
-           GROUP BY target HAVING n > 10
-           ORDER BY n DESC LIMIT 10
-        """, (since,)):
+        for row in [r for r in _redundant_reads(c, since) if r["n"] > 10][:10]:
             key = _key("repeat-file", row["target"] or "?")
             if _is_dismissed(db_path, key):
                 continue
             out.append({
                 "key": key, "category": "repeat-file",
-                "title": f"{row['target']} read {row['n']} times",
-                "body": f"This file was opened {row['n']} times across {row['sessions']} sessions in the past 7 days. A summary in CLAUDE.md or one read per session would avoid repeats.",
+                "title": f"{row['target']} re-read {row['n']} times",
+                "body": f"Claude re-read this file {row['n']} times across {row['sessions']} sessions in the past 7 days without having changed it in between. A short summary of it in CLAUDE.md would save those reads.",
                 "scope": row["target"],
             })
         for row in c.execute("""
@@ -105,35 +130,50 @@ def repeated_target_tips(db_path, today_iso: Optional[str] = None) -> List[dict]
     return out
 
 
-def right_size_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
+SHORT_PROMPT_OUTPUT_TOKENS = 500
+
+
+def right_size_tips(db_path, today_iso: Optional[str] = None,
+                    pricing: Optional[dict] = None) -> List[dict]:
+    """Whole prompts answered on Opus with a short total reply.
+
+    Judged per prompt (every API call it triggered, tool loop included), not
+    per API step: a multi-step task has many short steps but can't switch
+    model halfway, while a quick question answered in a few hundred tokens
+    genuinely could have run on Sonnet.
+    """
     today_iso = today_iso or datetime.utcnow().isoformat()
     since = _iso_days_ago(today_iso, 7)
-    sql = """
-      SELECT COUNT(*) AS n,
-             SUM(input_tokens+cache_create_5m_tokens+cache_create_1h_tokens) AS in_tok,
-             SUM(output_tokens) AS out_tok
-        FROM messages
-       WHERE type='assistant' AND model LIKE '%opus%'
-         AND output_tokens < 500 AND is_sidechain = 0
-         AND timestamp >= ?
-    """
-    with connect(db_path) as c:
-        row = c.execute(sql, (since,)).fetchone()
-    if not row or (row["n"] or 0) < 10:
-        return []
-    api_opus   = ((row["in_tok"] or 0) * 15 + (row["out_tok"] or 0) * 75) / 1_000_000
-    api_sonnet = ((row["in_tok"] or 0) *  3 + (row["out_tok"] or 0) * 15) / 1_000_000
+    pricing = pricing or load_pricing()
+    prompts = {}
+    for row in prompt_usage(db_path, since=since):
+        if row["api_calls"]:
+            prompts.setdefault(row["user_uuid"], []).append(row)
+    n, api_opus, api_sonnet = 0, 0.0, 0.0
+    for rows in prompts.values():
+        if any(_tier_from_name(r["model"]) != "opus" for r in rows):
+            continue
+        if sum(r["output_tokens"] for r in rows) >= SHORT_PROMPT_OUTPUT_TOKENS:
+            continue
+        n += 1
+        for r in rows:
+            api_opus += cost_for(r["model"], r, pricing)["usd"] or 0.0
+            api_sonnet += cost_for("sonnet", r, pricing)["usd"] or 0.0
     savings = api_opus - api_sonnet
-    if savings < 1.0:
+    if n < 10 or savings < 1.0:
         return []
-    key = _key("right-size", "opus-short-turns-7d")
+    key = _key("right-size", "opus-short-prompts-7d")
     if _is_dismissed(db_path, key):
         return []
     return [{
         "key": key, "category": "right-size",
-        "title": f"{row['n']} short Opus turns might fit on Sonnet",
-        "body": f"Opus turns under 500 output tokens cost ~${api_opus:.2f} in the last 7 days. Sonnet would have cost ~${api_sonnet:.2f} (savings ~${savings:.2f}).",
-        "scope": "opus-short-turns-7d",
+        "title": f"{n} quick Opus prompts might fit on Sonnet",
+        "body": (f"{n} prompts in the last 7 days got a complete answer in under "
+                 f"{SHORT_PROMPT_OUTPUT_TOKENS} output tokens on Opus, costing ~${api_opus:.2f}. "
+                 f"At current Sonnet rates they'd have cost ~${api_sonnet:.2f} (savings ~${savings:.2f}). "
+                 f"Switching model mid-session resets the cache, so this pays off for quick "
+                 f"questions asked in a separate session."),
+        "scope": "opus-short-prompts-7d",
     }]
 
 
@@ -177,10 +217,11 @@ def outlier_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
     return out
 
 
-def all_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
+def all_tips(db_path, today_iso: Optional[str] = None,
+             pricing: Optional[dict] = None) -> List[dict]:
     return [
         *cache_discipline_tips(db_path, today_iso),
         *repeated_target_tips(db_path, today_iso),
-        *right_size_tips(db_path, today_iso),
+        *right_size_tips(db_path, today_iso, pricing),
         *outlier_tips(db_path, today_iso),
     ]

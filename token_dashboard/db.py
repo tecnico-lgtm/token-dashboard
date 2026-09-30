@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import os
-import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional, Union
+from typing import Union
+
+from .naming import best_project_name, project_name_for, project_names  # noqa: F401  (re-exported)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -40,7 +41,9 @@ CREATE TABLE IF NOT EXISTS messages (
   cache_create_1h_tokens  INTEGER NOT NULL DEFAULT 0,
   prompt_text             TEXT,
   prompt_chars            INTEGER,
-  tool_calls_json         TEXT
+  tool_calls_json         TEXT,
+  is_prompt               INTEGER NOT NULL DEFAULT 0,
+  is_meta                 INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session   ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_project   ON messages(project_slug);
@@ -57,12 +60,14 @@ CREATE TABLE IF NOT EXISTS tool_calls (
   target        TEXT,
   result_tokens INTEGER,
   is_error      INTEGER NOT NULL DEFAULT 0,
-  timestamp     TEXT    NOT NULL
+  timestamp     TEXT    NOT NULL,
+  tool_use_id   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tools_session ON tool_calls(session_id);
 CREATE INDEX IF NOT EXISTS idx_tools_name    ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tools_target  ON tool_calls(target);
 CREATE INDEX IF NOT EXISTS idx_tools_msg     ON tool_calls(message_uuid);
+CREATE INDEX IF NOT EXISTS idx_tools_use_id  ON tool_calls(tool_use_id);
 
 CREATE TABLE IF NOT EXISTS plan (
   k TEXT PRIMARY KEY,
@@ -85,7 +90,14 @@ def init_db(path: Union[str, Path]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as c:
         _migrate_add_message_id(c)
+        _migrate_add_prompt_flags(c)
         c.executescript(SCHEMA)
+
+
+def _reset_scan_state(conn) -> None:
+    conn.execute("DELETE FROM messages")
+    conn.execute("DELETE FROM tool_calls")
+    conn.execute("DELETE FROM files")
 
 
 def _migrate_add_message_id(conn) -> None:
@@ -105,9 +117,34 @@ def _migrate_add_message_id(conn) -> None:
     if "message_id" in cols:
         return
     conn.execute("ALTER TABLE messages ADD COLUMN message_id TEXT")
-    conn.execute("DELETE FROM messages")
-    conn.execute("DELETE FROM tool_calls")
-    conn.execute("DELETE FROM files")
+    _reset_scan_state(conn)
+    conn.commit()
+
+
+def _migrate_add_prompt_flags(conn) -> None:
+    """Add messages.is_prompt / is_meta and tool_calls.tool_use_id.
+
+    Why: tool results, isMeta injections and command output are all
+    type='user' records, so counting or joining on type='user' mistook them
+    for human prompts; tool_use_id links a Skill call to the skill body
+    loaded after it. Both can only be derived from the raw JSONL, so
+    existing rows are cleared and the next scan replays the files.
+    """
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'"
+    ).fetchone()
+    if not has_table:
+        return
+    msg_cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    tool_cols = {row[1] for row in conn.execute("PRAGMA table_info(tool_calls)")}
+    if "is_prompt" in msg_cols and "tool_use_id" in tool_cols:
+        return
+    if "is_prompt" not in msg_cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN is_prompt INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE messages ADD COLUMN is_meta INTEGER NOT NULL DEFAULT 0")
+    if "tool_use_id" not in tool_cols:
+        conn.execute("ALTER TABLE tool_calls ADD COLUMN tool_use_id TEXT")
+    _reset_scan_state(conn)
     conn.commit()
 
 
@@ -131,67 +168,11 @@ def _range_clause(since, until, col: str = "timestamp"):
     return ((" AND " + " AND ".join(where)) if where else "", args)
 
 
-def _encode_slug(path: str) -> str:
-    """Claude Code's project-slug encoding: each of `:`, `\\`, `/`, space → one `-`."""
-    return re.sub(r"[:\\/ ]", "-", path)
-
-
-def _walk_to_root(cwd: str, slug: str) -> Optional[str]:
-    """If any ancestor of cwd encodes to slug, return that ancestor's basename."""
-    if not cwd or not slug:
-        return None
-    trimmed = cwd.rstrip("/\\")
-    sep = "\\" if "\\" in trimmed else "/"
-    parts = trimmed.split(sep)
-    for i in range(len(parts), 0, -1):
-        if _encode_slug(sep.join(parts[:i])) == slug:
-            name = parts[i - 1]
-            if name:
-                return name
-    return None
-
-
-def project_name_for(cwd: Optional[str], fallback_slug: str) -> str:
-    """Pretty project name from a single cwd + slug (best-effort).
-
-    For the multi-cwd case, prefer `best_project_name`.
-    """
-    name = _walk_to_root(cwd or "", fallback_slug or "")
-    if name:
-        return name
-    if cwd:
-        trimmed = cwd.rstrip("/\\")
-        sep = "\\" if "\\" in trimmed else "/"
-        tail = trimmed.split(sep)[-1]
-        if tail:
-            return tail
-    if fallback_slug:
-        parts = [p for p in re.split(r"-+", fallback_slug) if p]
-        if parts:
-            return parts[-1]
-    return fallback_slug or ""
-
-
-def best_project_name(cwds, slug: str) -> str:
-    """Pick a pretty name from a list of cwds.
-
-    Prefer a cwd whose walk-up matches `slug` (a true descendant of the project
-    root). If none match, fall back to `project_name_for` on the first cwd,
-    then to the slug's last segment.
-    """
-    cwds = [c for c in (cwds or []) if c]
-    for cwd in cwds:
-        name = _walk_to_root(cwd, slug)
-        if name:
-            return name
-    return project_name_for(cwds[0] if cwds else None, slug)
-
-
 def overview_totals(db_path, since=None, until=None) -> dict:
     rng, args = _range_clause(since, until)
     sql = f"""
       SELECT COUNT(DISTINCT session_id) AS sessions,
-             SUM(CASE WHEN type='user' THEN 1 ELSE 0 END) AS turns,
+             COALESCE(SUM(is_prompt),0)               AS turns,
              COALESCE(SUM(input_tokens),0)            AS input_tokens,
              COALESCE(SUM(output_tokens),0)           AS output_tokens,
              COALESCE(SUM(cache_read_tokens),0)       AS cache_read_tokens,
@@ -203,28 +184,48 @@ def overview_totals(db_path, since=None, until=None) -> dict:
         return dict(c.execute(sql, args).fetchone())
 
 
-def expensive_prompts(db_path, limit: int = 50, sort: str = "tokens") -> list:
-    """User prompt joined with the immediately-following assistant turn's tokens.
+PROMPT_USAGE_SQL = """
+  WITH seq AS (
+    SELECT uuid, session_id, project_slug, type, timestamp, model, is_prompt,
+           prompt_text, prompt_chars,
+           input_tokens, output_tokens, cache_read_tokens,
+           cache_create_5m_tokens, cache_create_1h_tokens,
+           SUM(is_prompt) OVER (PARTITION BY session_id ORDER BY timestamp, rowid
+                                ROWS UNBOUNDED PRECEDING) AS grp
+      FROM messages
+  ),
+  usage AS (
+    SELECT session_id, grp, model, COUNT(*) AS api_calls,
+           SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
+           SUM(cache_read_tokens) AS cache_read_tokens,
+           SUM(cache_create_5m_tokens) AS cache_create_5m_tokens,
+           SUM(cache_create_1h_tokens) AS cache_create_1h_tokens
+      FROM seq WHERE type='assistant' AND grp > 0
+     GROUP BY session_id, grp, model
+  )
+  SELECT p.uuid AS user_uuid, p.session_id, p.project_slug, p.timestamp,
+         p.prompt_text, p.prompt_chars,
+         u.model, COALESCE(u.api_calls,0) AS api_calls,
+         COALESCE(u.input_tokens,0) AS input_tokens, COALESCE(u.output_tokens,0) AS output_tokens,
+         COALESCE(u.cache_read_tokens,0) AS cache_read_tokens,
+         COALESCE(u.cache_create_5m_tokens,0) AS cache_create_5m_tokens,
+         COALESCE(u.cache_create_1h_tokens,0) AS cache_create_1h_tokens
+    FROM seq p
+    LEFT JOIN usage u ON u.session_id = p.session_id AND u.grp = p.grp
+   WHERE p.is_prompt = 1 {rng}
+"""
 
-    sort="tokens" (default) → largest billable first.
-    sort="recent"           → newest first.
+
+def prompt_usage(db_path, since=None, until=None) -> list:
+    """One row per (human prompt, model) with the usage of every API call it caused.
+
+    Each assistant record belongs to the most recent prompt in its session, so
+    a prompt's cost covers the whole tool loop and any subagents it spawned,
+    not just the first reply.
     """
-    order = "u.timestamp DESC" if sort == "recent" else "billable_tokens DESC"
-    sql = f"""
-      SELECT u.uuid AS user_uuid, u.session_id, u.project_slug, u.timestamp,
-             u.prompt_text, u.prompt_chars,
-             a.uuid AS assistant_uuid, a.model,
-             COALESCE(a.input_tokens,0)+COALESCE(a.output_tokens,0)
-               +COALESCE(a.cache_create_5m_tokens,0)+COALESCE(a.cache_create_1h_tokens,0) AS billable_tokens,
-             COALESCE(a.cache_read_tokens,0) AS cache_read_tokens
-        FROM messages u
-        JOIN messages a ON a.parent_uuid = u.uuid AND a.type='assistant'
-       WHERE u.type='user' AND u.prompt_text IS NOT NULL
-       ORDER BY {order}
-       LIMIT ?
-    """
+    rng, args = _range_clause(since, until, col="p.timestamp")
     with connect(db_path) as c:
-        return [dict(r) for r in c.execute(sql, (limit,))]
+        return [dict(r) for r in c.execute(PROMPT_USAGE_SQL.format(rng=rng), args)]
 
 
 def project_summary(db_path, since=None, until=None) -> list:
@@ -232,7 +233,7 @@ def project_summary(db_path, since=None, until=None) -> list:
     sql = f"""
       SELECT project_slug,
              COUNT(DISTINCT session_id) AS sessions,
-             SUM(CASE WHEN type='user' THEN 1 ELSE 0 END) AS turns,
+             COALESCE(SUM(is_prompt), 0)     AS turns,
              COALESCE(SUM(input_tokens), 0)  AS input_tokens,
              COALESCE(SUM(output_tokens), 0) AS output_tokens,
              SUM(input_tokens)+SUM(output_tokens)
@@ -245,12 +246,9 @@ def project_summary(db_path, since=None, until=None) -> list:
     """
     with connect(db_path) as c:
         rows = [dict(r) for r in c.execute(sql, args)]
-        for r in rows:
-            cwds = [row["cwd"] for row in c.execute(
-                "SELECT DISTINCT cwd FROM messages WHERE project_slug=? AND cwd IS NOT NULL",
-                (r["project_slug"],),
-            )]
-            r["project_name"] = best_project_name(cwds, r["project_slug"])
+        names = project_names(c)
+    for r in rows:
+        r["project_name"] = names.get(r["project_slug"], r["project_slug"])
     return rows
 
 
@@ -261,7 +259,7 @@ def tool_token_breakdown(db_path, since=None, until=None) -> list:
              COUNT(*) AS calls,
              COALESCE(SUM(result_tokens),0) AS result_tokens
         FROM tool_calls
-       WHERE tool_name != '_tool_result' {rng}
+       WHERE tool_name NOT IN ('_tool_result', '_skill_body') {rng}
        GROUP BY tool_name
        ORDER BY calls DESC
     """
@@ -269,32 +267,36 @@ def tool_token_breakdown(db_path, since=None, until=None) -> list:
         return [dict(r) for r in c.execute(sql, args)]
 
 
-def recent_sessions(db_path, limit: int = 20, since=None, until=None) -> list:
+def recent_sessions(db_path, limit: int = 20, since=None, until=None,
+                    include_empty: bool = False) -> list:
+    """Most recently active sessions first.
+
+    ``tokens`` is billable (input + output + cache writes), matching the
+    Projects and Prompts views. Sessions where Claude never answered (a
+    stray ``/model`` or an immediate exit) are hidden unless include_empty.
+    """
     rng, args = _range_clause(since, until)
+    having = "" if include_empty else """
+      HAVING SUM(input_tokens + output_tokens + cache_read_tokens
+                 + cache_create_5m_tokens + cache_create_1h_tokens) > 0"""
     sql = f"""
       SELECT session_id, project_slug,
              MIN(timestamp) AS started, MAX(timestamp) AS ended,
-             SUM(CASE WHEN type='user' THEN 1 ELSE 0 END) AS turns,
-             SUM(input_tokens)+SUM(output_tokens) AS tokens
+             COALESCE(SUM(is_prompt), 0) AS turns,
+             SUM(input_tokens)+SUM(output_tokens)
+               +SUM(cache_create_5m_tokens)+SUM(cache_create_1h_tokens) AS tokens,
+             SUM(cache_read_tokens) AS cache_read_tokens
         FROM messages m
        WHERE 1=1 {rng}
-       GROUP BY session_id
+       GROUP BY session_id {having}
        ORDER BY ended DESC
        LIMIT ?
     """
     with connect(db_path) as c:
         rows = [dict(r) for r in c.execute(sql, (*args, limit))]
-        # Cache per-slug name lookups so we don't query once per session.
-        slug_cache = {}
-        for r in rows:
-            slug = r["project_slug"]
-            if slug not in slug_cache:
-                cwds = [row["cwd"] for row in c.execute(
-                    "SELECT DISTINCT cwd FROM messages WHERE project_slug=? AND cwd IS NOT NULL",
-                    (slug,),
-                )]
-                slug_cache[slug] = best_project_name(cwds, slug)
-            r["project_name"] = slug_cache[slug]
+        names = project_names(c)
+    for r in rows:
+        r["project_name"] = names.get(r["project_slug"], r["project_slug"])
     return rows
 
 
@@ -331,16 +333,30 @@ def daily_token_breakdown(db_path, since=None, until=None) -> list:
         return [dict(r) for r in c.execute(sql, args)]
 
 
+def skill_body_tokens(db_path, since=None, until=None) -> dict:
+    """{skill: average tokens of the skill text loaded per call}, measured.
+
+    The Skill tool_result is only a tiny "Launching skill" ack; the real
+    content arrives in an isMeta message the scanner stores as a
+    ``_skill_body`` row keyed by the Skill call's tool_use_id.
+    """
+    rng, args = _range_clause(since, until, col="s.timestamp")
+    sql = f"""
+      SELECT s.target AS skill, CAST(ROUND(AVG(b.result_tokens)) AS INTEGER) AS tokens
+        FROM tool_calls s
+        JOIN tool_calls b ON b.tool_use_id = s.tool_use_id AND b.tool_name = '_skill_body'
+       WHERE s.tool_name = 'Skill' AND s.target IS NOT NULL {rng}
+       GROUP BY s.target
+    """
+    with connect(db_path) as c:
+        return {r["skill"]: r["tokens"] for r in c.execute(sql, args)}
+
+
 def skill_breakdown(db_path, since=None, until=None) -> list:
     """Per-skill invocation counts, distinct sessions, last-used timestamp.
 
-    Token attribution per skill is not included: in Claude Code, a Skill's
-    content is loaded via a system-reminder on the next turn, not as the
-    tool_result body — so `result_tokens` on _tool_result rows reflects the
-    activation ack (tiny), not the skill definition (which is what actually
-    fills context). A future schema change (storing tool_use_id on the
-    invocation row) could enable precise attribution; for now we only expose
-    the reliable counts.
+    Token sizes come separately from ``skill_body_tokens`` (measured from the
+    transcript) with the on-disk SKILL.md catalog as a fallback.
     """
     rng, args = _range_clause(since, until)
     sql = f"""
