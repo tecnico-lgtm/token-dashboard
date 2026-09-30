@@ -273,5 +273,6 @@ def scan_dir(projects_root: Union[str, Path], db_path: Union[str, Path]) -> dict
             totals["messages"] += sub["messages"]
             totals["tools"]    += sub["tools"]
             totals["files"]    += 1
-        conn.commit()
+            # Commit per file so an interrupted first scan keeps its progress.
+            conn.commit()
     return totals
